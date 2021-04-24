@@ -20,7 +20,8 @@ import (
 	"fmt"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/label"
+	"go.opentelemetry.io/otel/attribute"
+        "go.opentelemetry.io/otel/sdk/resource"
 
 	"log"
 	"math/rand"
@@ -42,27 +43,43 @@ var (
 )
 
 // initTracer creates a new trace provider instance and registers it as global trace provider.
-func initTracer() func() {
-	// Create and install Jaeger export pipeline.
-	flush, err := jaeger.InstallNewPipeline(
-		jaeger.WithCollectorEndpoint("http://<jaeger-endpoint:port>/api/traces"),
-		jaeger.WithProcess(jaeger.Process{
-			ServiceName: "kafka-producer",
-			Tags: []label.KeyValue{
-				label.String("exporter", "jaeger"),
-			},
-		}),
-		jaeger.WithSDK(&sdktrace.Config{DefaultSampler: sdktrace.AlwaysSample()}),
-	)
+func tracerProvider(url string) (*sdktrace.TracerProvider, error) {
+	// Create the Jaeger exporter
+	exp, err := jaeger.NewRawExporter(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(url)))
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	return flush
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			attribute.String("service.name","kafka-producer"),
+			attribute.String("exporter", "jaeger"),
+		)),
+	)
+        otel.SetTracerProvider(tp)
+        return tp, nil
+       
 }
 
 func main() {
-	flush := initTracer()
-	defer flush()
+	tp, tperr := tracerProvider("http://<jaeger-endpoint:port>/api/traces")
+
+        if tperr != nil{
+		log.Fatal(tperr)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Cleanly shutdown and flush telemetry when the application exits.
+	defer func(ctx context.Context) {
+		// Do not make the application hang when it is shutdown.
+		ctx, cancel = context.WithTimeout(ctx, time.Second*5)
+		defer cancel()
+		if err := tp.Shutdown(ctx); err != nil {
+			log.Fatal(err)
+		}
+	}(ctx)
 
 	flag.Parse()
 
@@ -81,7 +98,7 @@ func main() {
 	}
 	// Create root span encompassing prior work + producing to the kafka topic
 
-	tr := otel.Tracer("producer")
+	tr := tp.Tracer("producer")
 	ctx, span := tr.Start(context.Background(), "produce message")
 	defer span.End()
 	propagators := propagation.TraceContext{}
@@ -104,9 +121,9 @@ func main() {
 	log.Println("Successful to write message, offset:", successMsg.Offset)
 
 
-	span.SetAttributes(label.String("test-producer-span-key","test-producer-span-value"))
-	//span.SetAttributes(label.String("sent message at offset",strconv.FormatInt(int64(successMsg.Offset),10)))
-	//span.SetAttributes(label.String("sent message to partition",strconv.FormatInt(int64(successMsg.Partition),10)))
+	span.SetAttributes(attribute.String("test-producer-span-key","test-producer-span-value"))
+	//span.SetAttributes(attribute.String("sent message at offset",strconv.FormatInt(int64(successMsg.Offset),10)))
+	//span.SetAttributes(attribute.String("sent message to partition",strconv.FormatInt(int64(successMsg.Partition),10)))
 
 	err := producer.Close()
 	if err != nil {
