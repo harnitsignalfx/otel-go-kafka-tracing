@@ -21,9 +21,11 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/github.com/Shopify/sarama/otelsarama"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/trace/jaeger"
-	"go.opentelemetry.io/otel/label"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+        "time"
 	"log"
 	"os"
 	"strings"
@@ -33,28 +35,55 @@ var (
 	brokers = flag.String("brokers", os.Getenv("KAFKA_PEERS"), "The Kafka brokers to connect to, as a comma separated list")
 )
 
-// initTracer creates a new trace provider instance and registers it as global trace provider.
-func initTracer() func() {
-	// Create and install Jaeger export pipeline.
-	flush, err := jaeger.InstallNewPipeline(
-		jaeger.WithCollectorEndpoint("http://<jaeger-endpoint:port>/api/traces"),
-		jaeger.WithProcess(jaeger.Process{
-			ServiceName: "kafka-consumer",
-			Tags: []label.KeyValue{
-				label.String("exporter", "jaeger"),
-			},
-		}),
-		jaeger.WithSDK(&sdktrace.Config{DefaultSampler: sdktrace.AlwaysSample()}),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	return flush
+// tracerProvider creates a new trace provider instance and registers it as global trace provider.
+func tracerProvider(url string) (*sdktrace.TracerProvider, error) {
+        // Create the Jaeger exporter
+        exp, err := jaeger.NewRawExporter(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(url)))
+        if err != nil {
+                return nil, err
+        }
+        tp := sdktrace.NewTracerProvider(
+                sdktrace.WithBatcher(exp),
+                sdktrace.WithResource(resource.NewWithAttributes(
+                        attribute.String("service.name","kafka-consumer"),
+                        attribute.String("exporter", "jaeger"),
+                )),
+        )
+        otel.SetTracerProvider(tp)
+        return tp, nil
+
 }
 
+
 func main() {
-	flush := initTracer()
-	defer flush()
+	
+	jaeger_endpoint,exists := os.LookupEnv("OTEL_ENDPOINT")
+
+        if !exists{
+                log.Println("Using localhost:14268 as OTEL_ENDPOINT")
+                jaeger_endpoint = "localhost:14268"
+        }
+
+        collectorEndpoint := "http://"+jaeger_endpoint+"/api/traces"
+
+        tp, tperr := tracerProvider(collectorEndpoint)
+        
+ 	if tperr != nil {
+		log.Fatal(tperr)
+	}
+
+        ctx, cancel := context.WithCancel(context.Background())
+        defer cancel()
+
+        // Cleanly shutdown and flush telemetry when the application exits.
+        defer func(ctx context.Context) {
+                // Do not make the application hang when it is shutdown.
+                ctx, cancel = context.WithTimeout(ctx, time.Second*5)
+                defer cancel()
+                if err := tp.Shutdown(ctx); err != nil {
+                        log.Fatal(err)
+                }
+        }(ctx)
 
 	flag.Parse()
 
@@ -121,12 +150,12 @@ func printMessage(msg *sarama.ConsumerMessage) {
 	// Emulate Work Loads (or any further processing as needed)
 	//time.Sleep(1 * time.Second)
 
-	span.SetAttributes(label.String("test-consumer-span-key","test-consumer-span-value"))
+	span.SetAttributes(attribute.String("test-consumer-span-key","test-consumer-span-value"))
 
 	// Set any additional attributes that might make sense
-	//span.SetAttributes(label.String("consumed message at offset",strconv.FormatInt(int64(msg.Offset),10)))
-	//span.SetAttributes(label.String("consumed message to partition",strconv.FormatInt(int64(msg.Partition),10)))
-	//span.SetAttributes(label.String("message_bus.destination",msg.Topic))
+	//span.SetAttributes(attribute.String("consumed message at offset",strconv.FormatInt(int64(msg.Offset),10)))
+	//span.SetAttributes(attribute.String("consumed message to partition",strconv.FormatInt(int64(msg.Partition),10)))
+	//span.SetAttributes(attribute.String("message_bus.destination",msg.Topic))
 
 
 	log.Println("Successful to read message: ", string(msg.Value), "at offset of ", msg.Offset)
